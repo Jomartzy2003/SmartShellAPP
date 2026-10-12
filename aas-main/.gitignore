@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Logs / runtime
+logs/
+*.log
+models/
+config/link_pin.json
+
+# Secrets / sensitive config (use .example as template)
+.env
+.env.*
+

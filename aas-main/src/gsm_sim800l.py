@@ -1,0 +1,266 @@
+"""
+SmartShell — SIM800L GSM module for SMS alerts.
+
+Sends SMS to emergency contacts via hardware UART.
+See docs/features/03_gsm_sim800l.md.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from typing import Any
+
+from src.config import SIM800L_BAUD, SIM800L_UART_DEVICE
+
+
+def send_at(ser: Any, cmd: str, timeout: float = 2.0) -> str:
+    """Send AT command and return response (newline-terminated commands)."""
+    ser.reset_input_buffer()
+    ser.write((cmd + "\r\n").encode())
+    deadline = time.monotonic() + timeout
+    buf: list[str] = []
+    while time.monotonic() < deadline:
+        if ser.in_waiting:
+            buf.append(ser.read(ser.in_waiting).decode("ascii", errors="replace"))
+        time.sleep(0.05)
+    return "".join(buf)
+
+
+
+def _extract_cms_error_code(resp: str) -> int | None:
+    """Extract +CMS ERROR numeric code from modem response if present."""
+    m = re.search(r"\+CMS ERROR:\s*(\d+)", resp)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _cmgs_submit_timeout_sec(text: str) -> float:
+    """Allow extra time for multipart SMS after Ctrl+Z (SIM800 can take several seconds)."""
+    # ~160 chars per GSM part; budget ~8s per part, minimum 20s.
+    parts = max(1, (len(text) + 159) // 160)
+    return max(20.0, 8.0 * parts)
+
+
+def _read_modem_response_after_cmgs(ser: Any, *, timeout_sec: float) -> str:
+    """
+    Read UART until CMGS submit finishes. Do not send another AT command here —
+    an extra CRLF during submit can abort long / multipart SMS.
+    """
+    deadline = time.monotonic() + timeout_sec
+    buf: list[str] = []
+    while time.monotonic() < deadline:
+        if ser.in_waiting:
+            buf.append(ser.read(ser.in_waiting).decode("ascii", errors="replace"))
+            combined = "".join(buf)
+            if "+CMS ERROR" in combined:
+                time.sleep(0.2)
+                if ser.in_waiting:
+                    buf.append(ser.read(ser.in_waiting).decode("ascii", errors="replace"))
+                break
+            if "+CMGS:" in combined and "OK" in combined:
+                time.sleep(0.15)
+                if ser.in_waiting:
+                    buf.append(ser.read(ser.in_waiting).decode("ascii", errors="replace"))
+                break
+            if "ERROR" in combined and "+CMGS:" not in combined:
+                break
+        else:
+            time.sleep(0.05)
+    return "".join(buf)
+
+
+def _cmgs_submit_ok(resp: str) -> bool:
+    """True when modem accepted the message (+CMGS, no CMS ERROR)."""
+    if "+CMS ERROR" in resp:
+        return False
+    if "+CMGS:" in resp:
+        return True
+    # Some firmware returns only OK; treat as success only without ERROR.
+    return "OK" in resp and "ERROR" not in resp
+
+
+class GSMSIM800L:
+    """
+    SIM800L GSM module interface for sending SMS.
+
+    Uses hardware UART (primary serial). Configure SIM800L_UART_DEVICE in config.
+    """
+
+    def __init__(self, device: str | None = None, dry_run: bool = False) -> None:
+        """
+        Initialize GSM module.
+
+        Args:
+            device: UART device path. Uses config default if None.
+            dry_run: If True, send_sms() logs but does not send.
+        """
+        self._device = device if device is not None else SIM800L_UART_DEVICE
+        self._dry_run = dry_run
+        self._ser: Any = None
+
+    def open(self) -> None:
+        """Open UART connection and verify module responds. Silently fails if unavailable."""
+        if self._dry_run:
+            return
+        try:
+            import serial
+
+            self._ser = serial.Serial(self._device, SIM800L_BAUD, timeout=0.5)
+            r = send_at(self._ser, "AT")
+            if "OK" not in r:
+                self._ser.close()
+                self._ser = None
+                return
+            # Disable command echo for cleaner responses on subsequent commands.
+            send_at(self._ser, "ATE0", timeout=1.0)
+        except (ImportError, OSError):
+            self._ser = None
+
+    def close(self) -> None:
+        """Close UART connection."""
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+    def send_sms(self, phone: str, text: str) -> bool:
+        """
+        Send SMS to the given phone number.
+
+        Args:
+            phone: E.164 format (e.g. +639171234567).
+            text: Message body.
+
+        Returns:
+            True if sent successfully, False otherwise.
+        """
+        ok, _ = self.send_sms_with_reason(phone, text)
+        return ok
+
+    def send_sms_with_reason(self, phone: str, text: str) -> tuple[bool, str]:
+        """
+        Send SMS and include a reason string for diagnostics.
+
+        Returns:
+            Tuple (ok, reason).
+        """
+        out = self.send_sms_detailed(phone, text)
+        return bool(out["ok"]), str(out["reason"])
+
+    def send_sms_detailed(self, phone: str, text: str) -> dict[str, Any]:
+        """
+        Send SMS and return detailed modem diagnostics.
+
+        Keys:
+            ok, reason, signal_strength, cmgs_response_raw,
+            final_submit_response_raw, cms_error_code
+        """
+        if self._dry_run:
+            return {
+                "ok": True,
+                "reason": "dry_run",
+                "signal_strength": 99,
+                "cmgs_response_raw": "",
+                "final_submit_response_raw": "",
+                "cms_error_code": None,
+            }
+        if self._ser is None:
+            self.open()
+        if self._ser is None:
+            return {
+                "ok": False,
+                "reason": "serial_open_failed",
+                "signal_strength": 99,
+                "cmgs_response_raw": "",
+                "final_submit_response_raw": "",
+                "cms_error_code": None,
+            }
+        signal_strength = self.check_signal()
+        cmgs_response_raw = ""
+        final_submit_response_raw = ""
+        try:
+            r = send_at(self._ser, "AT+CMGF=1", timeout=2.0)
+            if "OK" not in r:
+                return {
+                    "ok": False,
+                    "reason": "cmgf_failed",
+                    "signal_strength": signal_strength,
+                    "cmgs_response_raw": "",
+                    "final_submit_response_raw": r,
+                    "cms_error_code": _extract_cms_error_code(r),
+                }
+            cmgs_response_raw = send_at(self._ser, f'AT+CMGS="{phone}"', timeout=3.0)
+            if ">" not in cmgs_response_raw:
+                return {
+                    "ok": False,
+                    "reason": "cmgs_prompt_failed",
+                    "signal_strength": signal_strength,
+                    "cmgs_response_raw": cmgs_response_raw,
+                    "final_submit_response_raw": "",
+                    "cms_error_code": _extract_cms_error_code(cmgs_response_raw),
+                }
+            time.sleep(0.2)
+            self._ser.reset_input_buffer()
+            self._ser.write((text + "\x1a").encode())
+            submit_timeout = _cmgs_submit_timeout_sec(text)
+            final_submit_response_raw = _read_modem_response_after_cmgs(
+                self._ser, timeout_sec=submit_timeout
+            )
+            if _cmgs_submit_ok(final_submit_response_raw):
+                return {
+                    "ok": True,
+                    "reason": "ok",
+                    "signal_strength": signal_strength,
+                    "cmgs_response_raw": cmgs_response_raw,
+                    "final_submit_response_raw": final_submit_response_raw,
+                    "cms_error_code": _extract_cms_error_code(final_submit_response_raw),
+                }
+            reason = "send_not_acknowledged"
+            if "+CMS ERROR" in final_submit_response_raw:
+                reason = "cms_error"
+            elif "+CMGS:" not in final_submit_response_raw:
+                reason = "no_cmgs_response"
+            return {
+                "ok": False,
+                "reason": reason,
+                "signal_strength": signal_strength,
+                "cmgs_response_raw": cmgs_response_raw,
+                "final_submit_response_raw": final_submit_response_raw,
+                "cms_error_code": _extract_cms_error_code(final_submit_response_raw),
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "reason": f"exception:{e.__class__.__name__}",
+                "signal_strength": signal_strength,
+                "cmgs_response_raw": cmgs_response_raw,
+                "final_submit_response_raw": final_submit_response_raw,
+                "cms_error_code": _extract_cms_error_code(final_submit_response_raw),
+            }
+
+    def check_signal(self) -> int:
+        """
+        Get signal quality (0–31).
+
+        Returns:
+            CSQ value; 99 if unavailable.
+        """
+        if self._dry_run or self._ser is None:
+            return 99
+        r = send_at(self._ser, "AT+CSQ")
+        for line in r.splitlines():
+            if "+CSQ:" in line:
+                try:
+                    parts = line.split(":")
+                    val = int(parts[1].strip().split(",")[0])
+                    return min(31, max(0, val))
+                except (ValueError, IndexError):
+                    pass
+        return 99

@@ -1,0 +1,58 @@
+# Feature: MP3 Countdown Audio
+
+## Overview
+
+A DFPlayer Mini (or compatible) MP3 module plays pre-recorded countdown audio during the 5-second cancellation window through a **small speaker on the module** — not the Pi’s HDMI or USB audio.
+
+## Hardware
+
+| Item | Value |
+|------|-------|
+| Interface | UART (software serial) |
+| Pi Pins | TX=GPIO 19, RX=GPIO 26 (via 1kΩ), GND=Pin 30, VCC=5V Buck |
+| Baud | 9600 |
+| Protocol | 10-byte command format (0x7E ... 0xEF) |
+
+## DFPlayer Mini Commands
+
+| Command | Byte | Purpose |
+|---------|------|---------|
+| Play | 0x03 | Play track (param = track number) |
+| Stop | 0x16 | Stop playback |
+
+## Module Interface
+
+See `docs/phase0_module_boundaries.md` — `audio_mp3`:
+
+- `open()` / `close()` — Serial lifecycle
+- `play_track(track_num)` — Play track (1-based)
+- `stop()` — Stop playback
+
+## Audio files (SD card)
+
+On the DFPlayer microSD, use a folder named **`mp3`** at the card root with files **`0001.mp3`**, **`0002.mp3`**, … (four digits). The firmware command `play_track(1)` plays `mp3/0001.mp3`. You can keep copies in repo `assets/audio/` for editing, then deploy to the SD with the `0001.mp3` naming.
+
+## Implementation (Phase 1)
+
+- **File**: `src/audio_mp3.py`
+- **Class**: `AudioMP3(port=None, dry_run=False)`
+- **Usage**: `audio.open()`; `audio.play_track(1)` for countdown.
+- **Config**: `MP3_SERIAL_PORT` in `src/config.py`.
+
+
+## Isolated bench test
+
+```bash
+python -m src.audio_test --track 1
+python -m src.audio_test --probe-range 5 --track-sec 3
+python -m src.mp3_diag
+```
+
+`mp3_diag` runs reset (0x0C), TF select (0x09), volume, queries, `play_track`, stop, and an optional `01/001` folder play. There is no standard serial “LED on” command on these boards.
+
+Because TX-only wiring is common, use the speaker for confirmation when RX is unwired.
+
+## References
+
+- [DFPlayer Mini Datasheet](https://wiki.dfrobot.com/DFPlayer_Mini_SKU_DFR0299)
+- `docs/PLAN.md`, `src/config.py` — `MP3_TX_GPIO`, `MP3_RX_GPIO`, `MP3_BAUD`

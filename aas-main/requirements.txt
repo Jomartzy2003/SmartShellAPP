@@ -1,0 +1,30 @@
+# Smart Helmet Accident Alert System — Dependencies
+# Install: pip install -r requirements.txt
+
+# I2C / MPU6050
+smbus2>=0.4.0
+
+# Serial (GPS, SIM800L, MP3)
+pyserial>=3.5
+
+# Speech recognition (cancel detection)
+# Pi OS also needs: sudo apt install -y flac  (used by recognize_google)
+SpeechRecognition>=3.10.0
+pyaudio>=0.2.13
+# Vosk wheels are not always discoverable from PyPI/piwheels on Raspberry Pi.
+# These official v0.3.45 wheels are selected by CPU architecture when supported.
+vosk @ https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-0.3.45-py3-none-manylinux2014_aarch64.whl ; platform_machine == "aarch64"
+vosk @ https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-0.3.45-py3-none-linux_armv7l.whl ; platform_machine == "armv7l"
+# armv6l Pi fallback for offline keyword cancel.
+pocketsphinx>=5.0.0
+
+# Geofencing / geometry (Phase 2 — Biñan boundary)
+shapely>=2.0.0
+
+# GPIO (Raspberry Pi only; install fails on non-Pi)
+RPi.GPIO>=0.7.0
+pigpio>=1.78
+
+# Optional: for development/testing without hardware
+# pytest>=7.0.0
+# pytest-cov>=4.0.0

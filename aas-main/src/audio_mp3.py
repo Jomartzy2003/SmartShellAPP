@@ -1,0 +1,491 @@
+"""
+SmartShell — DFPlayer Mini MP3 module for countdown audio.
+
+Plays pre-recorded countdown during the cancellation window.
+See docs/features/04_audio_mp3.md.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from typing import Any
+
+from src.config import MP3_BAUD, MP3_BUSY_GPIO, MP3_RX_GPIO, MP3_SERIAL_PORT, MP3_TX_GPIO
+
+
+def _dfplayer_checksum(data: list[int]) -> int:
+    """Compute DFPlayer Mini checksum: -Sum(bytes 1..6) as 16-bit."""
+    s = sum(data[1:7]) & 0xFFFF
+    return (0x10000 - s) & 0xFFFF
+
+
+def _dfplayer_packet(command: int, param: int = 0, feedback: int = 0) -> bytes:
+    """Build a DFPlayer packet for command + 16-bit parameter."""
+    high = (param >> 8) & 0xFF
+    low = param & 0xFF
+    data = [0xFF, 0x06, command & 0xFF, feedback & 0x01, high, low]
+    chk = _dfplayer_checksum([0x7E] + data)
+    return bytes([0x7E] + data + [(chk >> 8) & 0xFF, chk & 0xFF, 0xEF])
+
+
+def _parse_dfplayer_frame(frame: bytes) -> dict[str, int] | None:
+    """Parse a 10-byte DFPlayer frame."""
+    if len(frame) != 10:
+        return None
+    if frame[0] != 0x7E or frame[9] != 0xEF:
+        return None
+    if frame[1] != 0xFF or frame[2] != 0x06:
+        return None
+    cmd = frame[3]
+    feedback = frame[4]
+    param_h = frame[5]
+    param_l = frame[6]
+    chk_h = frame[7]
+    chk_l = frame[8]
+    expected_chk = _dfplayer_checksum([0x7E, 0xFF, 0x06, cmd, feedback, param_h, param_l])
+    got_chk = ((chk_h << 8) | chk_l) & 0xFFFF
+    if expected_chk != got_chk:
+        return None
+    return {
+        "command": cmd,
+        "feedback": feedback,
+        "param": ((param_h << 8) | param_l) & 0xFFFF,
+    }
+
+
+class AudioMP3:
+    """
+    DFPlayer Mini MP3 module interface.
+
+    Plays tracks from SD card. Track 1 = countdown audio.
+    """
+
+    def __init__(self, port: str | None = None, dry_run: bool = False) -> None:
+        """
+        Initialize MP3 module.
+
+        Args:
+            port: Serial device path. Uses config default if None.
+            dry_run: If True, play_track() is a no-op.
+        """
+        self._port = port if port is not None else MP3_SERIAL_PORT
+        self._dry_run = dry_run
+        self._ser: Any = None
+        self._pi: Any = None
+        self._bb_rx_open = False
+        self._rx_buf = bytearray()
+        self._busy_gpio = MP3_BUSY_GPIO
+        self._active_serial_port: str | None = None
+
+    def open(self) -> None:
+        """Open MP3 transport (kernel serial or pigpio software UART)."""
+        if self._dry_run:
+            return
+        self._ser = None
+        self._pi = None
+        self._active_serial_port = None
+        if self._try_open_kernel_serial():
+            return
+        try:
+            import pigpio
+        except ImportError:
+            self._pi = None
+            return
+        self._pi = pigpio.pi()
+        if not getattr(self._pi, "connected", False):
+            self._pi = None
+            return
+        # Optional RX line for DFPlayer feedback/queries.
+        try:
+            try:
+                self._pi.bb_serial_read_close(MP3_RX_GPIO)
+            except Exception:
+                pass
+            self._pi.bb_serial_read_open(MP3_RX_GPIO, MP3_BAUD, 8)
+            self._bb_rx_open = True
+        except Exception:
+            self._bb_rx_open = False
+        if self._busy_gpio is not None:
+            try:
+                self._pi.set_mode(int(self._busy_gpio), pigpio.INPUT)  # type: ignore[name-defined]
+                self._pi.set_pull_up_down(int(self._busy_gpio), pigpio.PUD_UP)  # type: ignore[name-defined]
+            except Exception:
+                pass
+
+    def _try_open_kernel_serial(self) -> bool:
+        """
+        Open a kernel serial device only when MP3_SERIAL_PORT is set.
+
+        If the port is None, DFPlayer is expected on GPIO soft UART (pigpio);
+        we must not open an unrelated /dev/ttyUSB* (e.g. another adapter), or
+        play commands and RX feedback would not match the wired pins.
+        """
+        try:
+            import serial
+        except ImportError:
+            return False
+
+        if not self._port:
+            return False
+
+        candidates: list[str] = [str(self._port)]
+        if str(self._port).startswith("/dev/ttyUSB"):
+            for idx in range(4):
+                dev = f"/dev/ttyUSB{idx}"
+                if dev not in candidates:
+                    candidates.append(dev)
+
+        for dev in candidates:
+            if not os.path.exists(dev):
+                continue
+            try:
+                ser = serial.Serial(dev, MP3_BAUD, timeout=0.15)
+            except OSError:
+                continue
+            self._ser = ser
+            self._active_serial_port = dev
+            return True
+        return False
+
+    def close(self) -> None:
+        """Close serial connection."""
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+        if self._pi is not None:
+            if self._bb_rx_open:
+                try:
+                    self._pi.bb_serial_read_close(MP3_RX_GPIO)
+                except Exception:
+                    pass
+                self._bb_rx_open = False
+            try:
+                self._pi.stop()
+            except Exception:
+                pass
+            self._pi = None
+        self._rx_buf = bytearray()
+
+    def play_track(self, track_num: int) -> None:
+        """
+        Play track by index using DFPlayer command 0x03 (typical layout).
+
+        With the standard **mp3/** folder on the SD card, files should be named
+        ``0001.mp3``, ``0002.mp3``, …; track ``1`` plays ``mp3/0001.mp3``.
+        """
+        self.play_track_with_status(track_num)
+
+    def play_track_with_status(self, track_num: int) -> dict[str, Any]:
+        """
+        Send play command (0x03) and report whether bytes were written to the transport.
+
+        Note: ``ok`` means the UART write / pigpio wave completed — not that the
+        module decoded audio (use RX feedback or ear check for that).
+        """
+        track = max(1, min(255, int(track_num)))
+        if self._dry_run:
+            return {
+                "ok": True,
+                "reason": "dry_run",
+                "transport": "dry_run",
+                "serial_device": None,
+                "command": 0x03,
+                "param": track,
+                "packet_hex": "",
+                "path_hint": f"mp3/{track:04d}.mp3",
+            }
+        if self._ser is None and self._pi is None:
+            self.open()
+
+        if self._ser is None and self._pi is None:
+            return {
+                "ok": False,
+                "reason": "transport_not_open",
+                "transport": "none",
+                "serial_device": None,
+                "command": 0x03,
+                "param": track,
+                "packet_hex": "",
+                "path_hint": f"mp3/{track:04d}.mp3",
+            }
+
+        transport_kind = "kernel_serial" if self._ser is not None else "gpio_soft_uart"
+        serial_dev = self._active_serial_port if self._ser is not None else None
+
+        packet = _dfplayer_packet(command=0x03, param=track, feedback=0)
+        ok, reason = self._write_packet_result(packet)
+        return {
+            "ok": bool(ok),
+            "reason": reason,
+            "transport": transport_kind,
+            "serial_device": serial_dev,
+            "command": 0x03,
+            "param": track,
+            "packet_hex": packet.hex(),
+            "path_hint": f"mp3/{track:04d}.mp3",
+        }
+
+    def play_folder_track(self, folder_num: int, file_num: int) -> None:
+        """
+        Play file from folder using DFPlayer command 0x0F.
+
+        Example supported layout:
+            SD:/001/001.mp3
+            SD:/002/001.mp3
+        """
+        if self._dry_run:
+            return
+        if self._ser is None and self._pi is None:
+            self.open()
+        folder = max(1, min(99, int(folder_num)))
+        file_idx = max(1, min(255, int(file_num)))
+        param = ((folder & 0xFF) << 8) | (file_idx & 0xFF)
+        self.send_command(0x0F, param=param, feedback=False)
+
+    def stop(self) -> None:
+        """Stop playback. (DFPlayer command 0x16.)"""
+        if self._dry_run:
+            return
+        if self._ser is None and self._pi is None:
+            self.open()
+        self.send_command(0x16, param=0, feedback=False)
+
+    def set_volume(self, volume: int) -> None:
+        """Set playback volume to DFPlayer range 0..30."""
+        if self._dry_run:
+            return
+        v = max(0, min(30, int(volume)))
+        self.send_command(0x06, param=v, feedback=False)
+
+    def query_volume(self, timeout_sec: float = 0.6) -> int | None:
+        """Query current volume (requires RX feedback wiring)."""
+        resp = self.send_command(0x43, param=0, feedback=True, expected_cmd=0x43, timeout_sec=timeout_sec)
+        return None if resp is None else int(resp["param"])
+
+    def query_status(self, timeout_sec: float = 0.6) -> int | None:
+        """Query playback status code (requires RX feedback wiring)."""
+        resp = self.send_command(0x42, param=0, feedback=True, expected_cmd=0x42, timeout_sec=timeout_sec)
+        return None if resp is None else int(resp["param"])
+
+    def query_tf_file_count(self, timeout_sec: float = 0.6) -> int | None:
+        """Query total file count in TF card (requires RX feedback wiring)."""
+        resp = self.send_command(0x48, param=0, feedback=True, expected_cmd=0x48, timeout_sec=timeout_sec)
+        return None if resp is None else int(resp["param"])
+
+    def query_folder_file_count(self, folder_num: int, timeout_sec: float = 0.6) -> int | None:
+        """Query file count in a specific folder (command 0x4E, requires RX feedback)."""
+        folder = max(1, min(99, int(folder_num)))
+        resp = self.send_command(
+            0x4E,
+            param=folder,
+            feedback=True,
+            expected_cmd=0x4E,
+            timeout_sec=timeout_sec,
+        )
+        return None if resp is None else int(resp["param"])
+
+    def wait_for_playback_end(
+        self,
+        timeout_sec: float,
+        poll_interval_sec: float = 0.2,
+    ) -> bool | None:
+        """
+        Wait until DFPlayer reports playback stopped.
+
+        Returns:
+            True  -> playback completion detected from status polling
+            False -> status polling worked, but timeout reached while still playing
+            None  -> feedback unavailable; cannot determine completion reliably
+        """
+        deadline = time.monotonic() + max(0.2, float(timeout_sec))
+        idle_streak = 0
+        while time.monotonic() < deadline:
+            status = self.query_status(timeout_sec=0.35)
+            if status is None:
+                return None
+            # Common DFPlayer behavior: 0 when stopped, non-zero when active.
+            if int(status) == 0:
+                idle_streak += 1
+                if idle_streak >= 2:
+                    return True
+            else:
+                idle_streak = 0
+            time.sleep(max(0.05, float(poll_interval_sec)))
+        return False
+
+    def read_busy_state(self) -> str:
+        """
+        Read DFPlayer BUSY pin state when available.
+
+        Returns:
+            "playing" -> BUSY pin LOW (typical DFPlayer behavior)
+            "idle"    -> BUSY pin HIGH
+            "unknown" -> BUSY not wired or unreadable
+        """
+        if self._busy_gpio is None or self._pi is None:
+            return "unknown"
+        try:
+            level = int(self._pi.read(int(self._busy_gpio)))
+        except Exception:
+            return "unknown"
+        return "playing" if level == 0 else "idle"
+
+    def send_raw_command(self, command: int, param: int = 0) -> tuple[bool, str]:
+        """
+        Send one DFPlayer frame without requesting feedback byte in the packet.
+
+        Use for simple control commands (reset, source select, etc.).
+        """
+        if self._dry_run:
+            return True, "dry_run"
+        if self._ser is None and self._pi is None:
+            self.open()
+        if self._ser is None and self._pi is None:
+            return False, "transport_not_open"
+        packet = _dfplayer_packet(
+            command=command & 0xFF,
+            param=param & 0xFFFF,
+            feedback=0,
+        )
+        return self._write_packet_result(packet)
+
+    def dfplayer_module_reset(self) -> tuple[bool, str]:
+        """
+        Module reset (command 0x0C, param 0) — DFRobot-style DFPlayer Mini.
+
+        Wait ~1–2 s after success before other commands. Clones may differ.
+        """
+        return self.send_raw_command(0x0C, 0)
+
+    def dfplayer_select_tf_card(self) -> tuple[bool, str]:
+        """
+        Select TF/SD card as playback device (command 0x09, param 2).
+
+        Typical DFRobot mapping: 1=USB, 2=TF. Some MP3-TF-16P boards only support TF.
+        """
+        return self.send_raw_command(0x09, 2)
+
+    def dfplayer_wake_up(self) -> tuple[bool, str]:
+        """Wake from sleep (0x0B, param 0) on modules that support sleep."""
+        return self.send_raw_command(0x0B, 0)
+
+    def send_command(
+        self,
+        command: int,
+        param: int = 0,
+        feedback: bool = False,
+        expected_cmd: int | None = None,
+        timeout_sec: float = 0.5,
+    ) -> dict[str, int] | None:
+        """Send a raw DFPlayer command; optionally wait for response."""
+        if self._dry_run:
+            return None
+        if self._ser is None and self._pi is None:
+            self.open()
+        if self._ser is None and self._pi is None:
+            return None
+        packet = _dfplayer_packet(command=command, param=param, feedback=1 if feedback else 0)
+        self._write_packet(packet)
+        if not feedback:
+            return None
+        return self.read_response(expected_cmd=expected_cmd, timeout_sec=timeout_sec)
+
+    def read_response(
+        self,
+        expected_cmd: int | None = None,
+        timeout_sec: float = 0.5,
+    ) -> dict[str, int] | None:
+        """Read one DFPlayer response frame, if available."""
+        if self._dry_run:
+            return None
+        deadline = time.monotonic() + max(0.05, float(timeout_sec))
+        while time.monotonic() < deadline:
+            self._pump_input()
+            frame = self._pop_frame()
+            while frame is not None:
+                parsed = _parse_dfplayer_frame(frame)
+                if parsed is not None and (expected_cmd is None or parsed["command"] == expected_cmd):
+                    return parsed
+                frame = self._pop_frame()
+            time.sleep(0.01)
+        return None
+
+    def _write_packet_result(self, packet: bytes) -> tuple[bool, str]:
+        """Write raw packet; return (success, short reason for logs)."""
+        if self._ser is not None:
+            try:
+                self._ser.write(packet)
+                if hasattr(self._ser, "flush"):
+                    self._ser.flush()
+                return True, "serial_write_ok"
+            except Exception as e:
+                return False, f"serial_write_failed:{e}"
+        if self._pi is not None:
+            try:
+                self._pi.wave_clear()
+                self._pi.wave_add_serial(MP3_TX_GPIO, MP3_BAUD, packet)
+                wid = self._pi.wave_create()
+                if wid < 0:
+                    return False, f"pigpio_wave_create_failed:{wid}"
+                self._pi.wave_send_once(wid)
+                while self._pi.wave_tx_busy():
+                    time.sleep(0.001)
+                self._pi.wave_delete(wid)
+                time.sleep(0.03)
+                return True, "pigpio_wave_sent"
+            except Exception as e:
+                return False, f"pigpio_failed:{e}"
+        return False, "no_transport"
+
+    def _write_packet(self, packet: bytes) -> None:
+        """Write packet over kernel serial or pigpio TX wave serial."""
+        self._write_packet_result(packet)
+
+    def _pump_input(self) -> None:
+        """Read available RX bytes into local buffer."""
+        if self._ser is not None:
+            try:
+                waiting = getattr(self._ser, "in_waiting", 0)
+            except Exception:
+                waiting = 0
+            read_size = max(1, int(waiting)) if waiting else 1
+            try:
+                data = self._ser.read(read_size)
+            except Exception:
+                data = b""
+            if data:
+                self._rx_buf.extend(data)
+            return
+        if self._pi is not None and self._bb_rx_open:
+            try:
+                count, data = self._pi.bb_serial_read(MP3_RX_GPIO)
+            except Exception:
+                return
+            if count > 0 and data:
+                self._rx_buf.extend(data)
+
+    def _pop_frame(self) -> bytes | None:
+        """Pop next complete DFPlayer 10-byte frame from buffer."""
+        if not self._rx_buf:
+            return None
+        try:
+            start = self._rx_buf.index(0x7E)
+        except ValueError:
+            self._rx_buf.clear()
+            return None
+        if start > 0:
+            del self._rx_buf[:start]
+        if len(self._rx_buf) < 10:
+            return None
+        frame = bytes(self._rx_buf[:10])
+        del self._rx_buf[:10]
+        if frame[-1] != 0xEF:
+            # Realign to next frame marker if this one is malformed.
+            return self._pop_frame()
+        return frame
+
+

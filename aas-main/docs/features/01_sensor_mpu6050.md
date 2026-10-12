@@ -1,0 +1,69 @@
+# Feature: MPU-6050 Accident Detection
+
+## Overview
+
+The MPU-6050 is a 6-DOF IMU (accelerometer + gyroscope) used to detect potential accidents by monitoring sudden changes in acceleration and orientation.
+
+## Hardware
+
+| Item | Value |
+|------|-------|
+| Interface | I2C |
+| Address | 0x68 (default) |
+| Pi Pins | SDA=Pin 3, SCL=Pin 5, VCC=Pin 1 (3.3V), GND=Pin 14 |
+| Bus | I2C-1 (`/dev/i2c-1`) |
+
+## Detection Logic
+
+1. **Threshold**: Acceleration spike ≥ 3g–5g flags potential accident.
+2. **Validation**: Both sudden acceleration spike and abnormal tilt/orientation must be present.
+3. **Calibration**: Run at startup to establish baseline (device at rest).
+
+In code this maps to:
+
+- `impact_window_hit`: `3.0g <= accel_mag_g <= 5.0g`
+- `tilt_hit`: baseline delta `> 1.5g`
+- `actual_collision`: `impact_window_hit AND tilt_hit`
+
+## Module Interface
+
+See `docs/phase0_module_boundaries.md` — `sensor_mpu6050`:
+
+- `calibrate()` — Run at startup
+- `read_raw()` / `read_g()` — Get current values
+- `is_impact_detected()` — Returns True when threshold exceeded
+
+## Implementation (Phase 1)
+
+- **File**: `src/sensor_mpu6050.py`
+- **Class**: `SensorMPU6050(dry_run=False)`
+- **Usage**: `sensor.calibrate()` at startup; poll `sensor.is_impact_detected()` in main loop.
+
+Main loop logging behavior (`src/main.py`):
+
+- 3–5g samples are logged as `impact_window_hit_main` even if `tilt_hit=False`
+- Flags recorded per sample: `impact_window_hit`, `tilt_hit`, `actual_collision`, `action_collision`
+- Debounce controls:
+  - `--impact-log-cooldown-sec` (default from `IMPACT_LOG_COOLDOWN_SEC`)
+  - `--post-alert-cooldown-sec` (default from `POST_ALERT_COOLDOWN_SEC`) — starts when the alert cycle finishes, not at first impact
+
+## Isolated collision/tap debug test
+
+For focused hardware testing without GSM/GPS flow:
+
+```bash
+python -m src.mpu_collision_test
+```
+
+Useful options:
+
+```bash
+python -m src.mpu_collision_test --impact-g 1.5 --tilt-delta-g 0.8 --duration-sec 120
+```
+
+By default, JSONL at `logs/mpu_collision_*.jsonl` records **collision events** and a final **session_end** summary only. Use `--log-all-samples` to also write every sample plus `session_start` (verbose).
+
+## References
+
+- [MPU-6050 Datasheet](https://invensense.tdk.com/products/motion-tracking/6-axis/mpu-6050/)
+- `docs/PLAN.md`, `src/config.py` — `MPU6050_I2C_BUS`, `MPU6050_I2C_ADDR`

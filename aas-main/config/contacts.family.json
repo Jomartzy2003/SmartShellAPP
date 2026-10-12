@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "contacts": [
+    {
+      "name": "JM",
+      "phone": "+639202828660",
+      "priority": 1
+    },
+    {
+      "name": "Juls",
+      "phone": "+639278222260",
+      "priority": 2
+    },
+    {
+      "name": "Jom",
+      "phone": "+639922547260",
+      "priority": 3
+    }
+  ],
+  "rider_name": "Juan Dela Cruz",
+  "message_template": "SMARTSHELL COLLISION ALERT\n\nRider: {name}\nHome: {home_barangay}\nAccident: {accident_barangay}\n\nGPS: {map_url}",
+  "subject_home_barangay": "Zapote"
+}
